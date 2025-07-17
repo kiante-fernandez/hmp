@@ -338,7 +338,7 @@ def plot_topo_timecourse(
     # plot ylabels
     if isinstance(ylabels, dict):
         tick_labels = [str(x) for x in list(ylabels.values())[0]]
-        if group_plot:
+        if not combined and n_group > 1:  # reverse labels for group plots (not combined)
             tick_labels.reverse()
         ax.set_yticks(np.arange(len(list(ylabels.values())[0])) + 0.5, tick_labels)
         ax.set_ylabel(str(list(ylabels.keys())[0]))

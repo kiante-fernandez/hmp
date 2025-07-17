@@ -244,4 +244,3 @@ class Weibull():
             The calculated scale parameter.
         """
         return mean / self.gamma_func(1 + 1 / self.shape)
-        

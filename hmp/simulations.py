@@ -128,6 +128,7 @@ def simulate(
 
     os.environ["SUBJECTS_DIR"] = op.join(root,'simulation_parameters')
     path = op.join(os.getcwd(), path)
+    os.makedirs(path, exist_ok=True)
 
     if not verbose:
         mne.set_log_level("warning")
@@ -393,9 +394,12 @@ def demo(cpus, n_events, seed=123, overwrite=False):
 
     file = "demo_dataset"  # Name of the file to save
 
+    event_width = int(((1 / frequency) / 2) * 1000)
+
     # Simulating and recover information on electrode location and true time of the simulated events
     files = simulate(
-        sources, n_trials, cpus, file, path='sample_data', overwrite=overwrite, seed=seed, noise=True, sfreq=sfreq
+        sources, n_trials, cpus, file, path='sample_data', overwrite=overwrite, seed=seed, noise=True, sfreq=sfreq,
+        event_length_samples=[int(event_width / 1000 * sfreq)]*len(sources)
     )
 
     generating_events = np.load(files[1])
@@ -424,7 +428,7 @@ def demo(cpus, n_events, seed=123, overwrite=False):
     chan_list = [e for e in chan_list if e not in all_other_chans]
     chan_list.pop(52)  # Bad elec
     positions = mne.pick_info(positions, sel=chan_list)
-    return eeg_dat, random_source_times, positions
+    return eeg_dat, random_source_times, positions, event_width
 
 
 def classification_true(

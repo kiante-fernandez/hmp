@@ -12,7 +12,14 @@ import xarray as xr
 from pandas import MultiIndex
 
 from hmp.models.base import BaseModel
+from hmp.patterns import HalfSine
 from hmp.trialdata import TrialData
+
+try:
+    from hmp.estimators.base import EstimationResult
+except ImportError:
+    # Handle case where estimators module is not available
+    EstimationResult = None
 
 try:
     __IPYTHON__
@@ -73,7 +80,81 @@ class EventModel(BaseModel):
         self.grouping_dict = {}
         self.time_map = np.zeros((1, self.n_events + 1))
         self.channel_map = np.zeros((1, self.n_events))
-        super().__init__(*args, **kwargs)
+        if not args or not isinstance(args[0], HalfSine):
+            pattern = HalfSine.create_expected(sfreq=kwargs.pop('sfreq'), width=kwargs.pop('event_width'))
+            super().__init__(pattern, *args, **kwargs)
+        else:
+            super().__init__(*args, **kwargs)
+
+    def _prepare_parameters(self, trial_data: TrialData, channel_pars: np.ndarray = None,
+                           time_pars: np.ndarray = None, fixed_time_pars: list = None,
+                           fixed_channel_pars: list = None, grouping_dict: dict = None,
+                           channel_map: np.ndarray = None, time_map: np.ndarray = None,
+                           verbose: bool = True):
+        """
+        Prepare parameters for estimation.
+        
+        Returns
+        -------
+        tuple
+            (n_groups, groups, glabels, channel_map, time_map, channel_pars, time_pars, fixed_channel_pars, fixed_time_pars)
+        """
+        self.n_dims = trial_data.n_dims
+
+        if grouping_dict is None:
+            grouping_dict = self.grouping_dict
+            channel_map = self.channel_map
+            time_map = self.time_map
+        n_groups, groups, glabels = self.group_constructor(
+            trial_data, grouping_dict, channel_map, time_map, verbose
+        )
+        
+        # Formatting parameters
+        if isinstance(time_pars, (xr.DataArray, xr.Dataset)):
+            time_pars = time_pars.dropna(dim="stage").values
+        if isinstance(channel_pars, (xr.DataArray, xr.Dataset)):
+            channel_pars = channel_pars.dropna(dim="event").values
+        if isinstance(channel_pars, np.ndarray):
+            channel_pars = channel_pars.copy()
+        if isinstance(time_pars, np.ndarray):
+            time_pars = time_pars.copy()
+        if self.fixed_time_pars is None:
+            fixed_time_pars = [] if fixed_time_pars is None else fixed_time_pars
+        else:
+            fixed_time_pars = self.fixed_time_pars
+        if self.fixed_channel_pars is None:
+            fixed_channel_pars = [] if fixed_channel_pars is None else fixed_channel_pars
+        else:
+            fixed_channel_pars = self.fixed_channel_pars
+
+        if time_pars is None:
+            # If no time parameters starting points are provided generate standard ones
+            time_pars = (
+                np.zeros((n_groups, self.n_events + 1, 2)) * np.nan
+            )  # by default nan for missing stages
+            for cur_group in range(n_groups):
+                time_group = np.where(time_map[cur_group, :] >= 0)[0]
+                n_stage_group = len(time_group)
+                # by default starting point is to split the average duration in equal bins
+                time_pars[cur_group, time_group, :] = np.tile(
+                    [
+                        self.distribution.shape,
+                        self.distribution.mean_to_scale(
+                            np.mean(trial_data.durations[groups == cur_group]) / (n_stage_group)
+                        ),
+                    ],
+                    (n_stage_group, 1),
+                )
+
+        if channel_pars is None:
+            # By defaults c_pars are initiated to 0
+            channel_pars = np.zeros((n_groups, self.n_events, self.n_dims), dtype=np.float64)
+            if (channel_map < 0).any():  # set missing c_pars to nan
+                for cur_group in range(n_groups):
+                    channel_pars[cur_group, np.where(channel_map[cur_group, :] < 0)[0], :] = np.nan
+        
+        return (n_groups, groups, glabels, channel_map, time_map, channel_pars, time_pars, 
+                fixed_channel_pars, fixed_time_pars, grouping_dict)
 
     def fit(
         self,
@@ -87,6 +168,7 @@ class EventModel(BaseModel):
         channel_map: np.ndarray = None,
         time_map: np.ndarray = None,
         grouping_dict: dict = None,
+        estimator=None,
     ):
 
         """
@@ -125,31 +207,80 @@ class EventModel(BaseModel):
         grouping_dict : dict, optional
             Dictionary defining groups for grouping modeling. Keys are group names, and values are lists of groups.
             Default is None.
+        estimator : BaseEstimator, optional
+            Estimator to use for parameter fitting. If provided, returns EstimationResult.
+            If None, uses traditional EM approach and returns None (backward compatibility).
 
         Returns
         -------
-        None
+        EstimationResult or None
+            If estimator is provided, returns EstimationResult with fitted parameters.
+            If estimator is None, returns None and sets model attributes (backward compatibility).
         """
 
+        # If an estimator is provided, use the new estimation framework
+        if estimator is not None:
+            if EstimationResult is None:
+                raise ImportError("Estimators module not available. Cannot use estimator parameter.")
+            
+            # Prepare parameters using helper method
+            (n_groups, groups, glabels, channel_map, time_map, channel_pars, time_pars, 
+             fixed_channel_pars, fixed_time_pars, grouping_dict) = self._prepare_parameters(
+                trial_data, channel_pars, time_pars, fixed_time_pars, fixed_channel_pars,
+                grouping_dict, channel_map, time_map, verbose
+            )
+            
+            if verbose:
+                print(f"Estimating {self.n_events} events model using {estimator.get_method_name()}")
+            
+            # Use the estimator to fit parameters
+            result = estimator.fit(
+                trial_data=trial_data,
+                initial_channel_pars=channel_pars,
+                initial_time_pars=time_pars,
+                model=self,
+                fixed_channel_pars=fixed_channel_pars,
+                fixed_time_pars=fixed_time_pars,
+                channel_map=channel_map,
+                time_map=time_map,
+                groups=groups,
+                cpus=cpus
+            )
+            
+            # Set model attributes from result
+            self._fitted = True
+            self.lkhs = result.likelihood
+            self.channel_pars = result.channel_pars
+            self.time_pars = result.time_pars
+            self.traces = result.diagnostics.get('traces', [result.likelihood])
+            self.time_pars_dev = result.diagnostics.get('time_pars_dev', [result.time_pars])
+            self.grouping_dict = grouping_dict
+            self.group = groups
+            self.channel_map = channel_map
+            self.time_map = time_map
+            
+            return result
+        
+        # Traditional EM approach (backward compatibility)
         # A dict containing all the info we want to keep, populated along the func
         infos_to_store = {}
         infos_to_store["sfreq"] = self.sfreq
         infos_to_store["event_width_samples"] = self.event_width_samples
         infos_to_store["tolerance"] = self.tolerance
 
-        self.n_dims = trial_data.n_dims
-
-        if grouping_dict is None:
-            grouping_dict = self.grouping_dict
-            channel_map = self.channel_map
-            time_map = self.time_map
-        n_groups, groups, glabels = self.group_constructor(
-            trial_data, grouping_dict, channel_map, time_map, verbose
+        (n_groups, groups, glabels, channel_map, time_map, channel_pars, time_pars, 
+         fixed_channel_pars, fixed_time_pars, grouping_dict) = self._prepare_parameters(
+            trial_data, channel_pars, time_pars, fixed_time_pars, fixed_channel_pars,
+            grouping_dict, channel_map, time_map, verbose
         )
+        
         infos_to_store["channel_map"] = channel_map
         infos_to_store["time_map"] = time_map
         infos_to_store["glabels"] = glabels
         infos_to_store["grouping_dict"] = grouping_dict
+        infos_to_store["fixed_time_pars"] = fixed_time_pars
+        infos_to_store["fixed_channel_pars"] = fixed_channel_pars
+        
         if verbose:
             if time_pars is None:
                 print(
@@ -158,78 +289,34 @@ class EventModel(BaseModel):
             else:
                 print(f"Estimating {self.n_events} events model")
 
-        # Formatting parameters
-        if isinstance(time_pars, (xr.DataArray, xr.Dataset)):
-            time_pars = time_pars.dropna(dim="stage").values
-        if isinstance(channel_pars, (xr.DataArray, xr.Dataset)):
-            channel_pars = channel_pars.dropna(dim="event").values
-        if isinstance(channel_pars, np.ndarray):
-            channel_pars = channel_pars.copy()
-        if isinstance(time_pars, np.ndarray):
-            time_pars = time_pars.copy()
-        if self.fixed_time_pars is None:
-            fixed_time_pars = []
-        else:
-            fixed_time_pars = self.fixed_time_pars
-            infos_to_store["fixed_time_pars"] = fixed_time_pars
-        if self.fixed_channel_pars is None:
-            fixed_channel_pars = []
-        else:
-            fixed_channel_pars = self.fixed_channel_pars
-            infos_to_store["fixed_channel_pars"] = fixed_channel_pars
-
-        if time_pars is None:
-            # If no time parameters starting points are provided generate standard ones
-            # Or random ones if starting_points > 1
-            time_pars = (
-                np.zeros((n_groups, self.n_events + 1, 2)) * np.nan
-            )  # by default nan for missing stages
-            for cur_group in range(n_groups):
-                time_group = np.where(time_map[cur_group, :] >= 0)[0]
-                n_stage_group = len(time_group)
-                # by default starting point is to split the average duration in equal bins
-                time_pars[cur_group, time_group, :] = np.tile(
-                    [
-                        self.distribution.shape,
-                        self.distribution.mean_to_scale(
-                            np.mean(trial_data.durations[groups == cur_group]) / (n_stage_group)
-                        ),
-                    ],
-                    (n_stage_group, 1),
-                )
-            initial_p = time_pars
-            time_pars = [initial_p]
-            if self.starting_points > 1:
-                if self.max_scale is None:
-                    raise ValueError(
-                            "If using multiple starting points, a maximum distance between events needs "
-                            " to be provided using the max_scale argument."
-                        )
-                infos_to_store["starting_points"] = self.starting_points
-                for _ in np.arange(self.starting_points):
-                    proposal_p = (
-                        np.zeros((n_groups, self.n_events + 1, 2)) * np.nan
-                    )  # by default nan for missing stages
-                    for cur_group in range(n_groups):
-                        time_group = np.where(time_map[cur_group, :] >= 0)[0]
-                        n_stage_group = len(time_group)
-                        proposal_p[cur_group, time_group, :] = self.gen_random_stages(n_stage_group - 1)
-                        proposal_p[cur_group, fixed_time_pars, :] = initial_p[0, fixed_time_pars]
-                    time_pars.append(proposal_p)
-                time_pars = np.array(time_pars)
+        # Handle multiple starting points for traditional EM
+        initial_p = time_pars
+        time_pars = [initial_p]
+        if self.starting_points > 1:
+            if self.max_scale is None:
+                raise ValueError(
+                        "If using multiple starting points, a maximum distance between events needs "
+                        " to be provided using the max_scale argument."
+                    )
+            infos_to_store["starting_points"] = self.starting_points
+            for _ in np.arange(self.starting_points):
+                proposal_p = (
+                    np.zeros((n_groups, self.n_events + 1, 2)) * np.nan
+                )  # by default nan for missing stages
+                for cur_group in range(n_groups):
+                    time_group = np.where(time_map[cur_group, :] >= 0)[0]
+                    n_stage_group = len(time_group)
+                    proposal_p[cur_group, time_group, :] = self.gen_random_stages(n_stage_group - 1)
+                    proposal_p[cur_group, fixed_time_pars, :] = initial_p[fixed_time_pars]
+                time_pars.append(proposal_p)
+            time_pars = np.array(time_pars)
         else:
             infos_to_store["sp_time_pars"] = time_pars
 
-        if channel_pars is None:
-            # By defaults c_pars are initiated to 0
-            channel_pars = np.zeros((n_groups, self.n_events, self.n_dims), dtype=np.float64)
-            if (channel_map < 0).any():  # set missing c_pars to nan
-                for cur_group in range(n_groups):
-                    channel_pars[cur_group, np.where(channel_map[cur_group, :] < 0)[0], :] = np.nan
-            initial_m = channel_pars
-            channel_pars = np.tile(initial_m, (self.starting_points + 1, 1, 1, 1))
-        else:
-            infos_to_store["sp_channel_pars"] = channel_pars
+        # Handle multiple starting points for channel parameters
+        initial_m = channel_pars
+        channel_pars = np.tile(initial_m, (self.starting_points + 1, 1, 1, 1))
+        infos_to_store["sp_channel_pars"] = channel_pars
 
         if cpus > 1:
             inputs = zip(
@@ -723,10 +810,15 @@ class EventModel(BaseModel):
         if subset_epochs is not None:
             if len(subset_epochs) == trial_data.n_trials:  # boolean indices
                 subset_epochs = np.where(subset_epochs)[0]
-        n_trials = len(subset_epochs)
-        durations = trial_data.durations[subset_epochs]
-        starts = trial_data.starts[subset_epochs]
-        ends = trial_data.ends[subset_epochs]
+            n_trials = len(subset_epochs)
+            durations = trial_data.durations[subset_epochs]
+            starts = trial_data.starts[subset_epochs]
+            ends = trial_data.ends[subset_epochs]
+        else:
+            n_trials = trial_data.n_trials
+            durations = trial_data.durations
+            starts = trial_data.starts
+            ends = trial_data.ends
         max_duration = np.max(durations)
         gains = np.zeros((trial_data.n_samples, n_events), dtype=np.float64)
         for i in range(trial_data.n_dims):
