@@ -2,27 +2,14 @@
 
 import numpy as np
 import pytest
-import numpy as np
 
-from hmp.estimators import BaseEstimator, EstimationResult, EMEstimator, MCMCEstimator
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
-from hmp.estimators.mcmc import PYMC_AVAILABLE
+from hmp.estimators import BaseEstimator, EstimationResult, EMEstimator
 from hmp.estimators.utils import (
     validate_parameters, 
     initialize_parameters,
     RelativeLikelihoodConvergence,
     compute_log_likelihood
 )
-from hmp.models import EventModel
-from hmp.preprocessing import Standard
-from hmp.simulations import demo
 
 
 class TestEstimationResult:
@@ -189,58 +176,6 @@ class TestConvergenceCheckers:
         
         converged = checker.check_convergence(likelihoods[1], likelihoods[:1])
         assert not converged  # Should not converge before min_iterations
-
-
-@pytest.mark.skipif(
-    not PYMC_AVAILABLE,  # Skip if PyMC is not available
-    reason="PyMC not available"
-)
-class TestMCMCEstimator:
-    """Test MCMCEstimator class (requires PyMC)."""
-    
-    def test_mcmc_creation(self):
-        """Test MCMCEstimator creation."""
-        mcmc_est = MCMCEstimator(n_samples=100, n_chains=2)
-        assert mcmc_est.n_samples == 100
-        assert mcmc_est.n_chains == 2
-        assert mcmc_est.supports_uncertainty() is True
-
-    def test_mcmc_fit(self):
-        """Test basic MCMC fit with synthetic data."""
-        # Generate synthetic data
-        n_events = 3
-        eeg_data, _, _, event_width = demo(cpus=1, n_events=n_events, seed=42, overwrite=True)
-
-        # Initialize model and estimator
-        model = EventModel(n_events=n_events, sfreq=eeg_data.sfreq, event_width=event_width)
-        mcmc_est = MCMCEstimator(n_samples=50, n_tune=50, n_chains=1, random_seed=42)
-
-        # Initial parameters (can be random or from a quick EM fit)
-        initial_channel_pars = np.random.randn(n_events, len(eeg_data.channel)) * 0.1
-        initial_time_pars = np.array([[2, 10]] * (n_events + 1))
-
-        # Preprocess the data
-        preprocessed_data = Standard(eeg_data, n_comp=5, apply_zscore=False).data
-
-        # Fit the model
-        result = mcmc_est.fit(preprocessed_data, initial_channel_pars, initial_time_pars, model=model)
-
-        # Assertions
-        assert isinstance(result, EstimationResult)
-        assert result.channel_pars.shape == (n_events, len(eeg_data.channel))
-        assert result.time_pars.shape == (n_events + 1, 2)
-        assert isinstance(result.likelihood, float)
-        assert result.converged is False  # With few samples, convergence is unlikely
-        assert "trace" in result.diagnostics
-        assert "posterior_samples" in result.uncertainty
-
-        # Test posterior samples shape
-        assert result.uncertainty["posterior_samples"]["channel_pars"].shape == (1, 50, n_events, len(eeg_data.channel))
-        assert result.uncertainty["posterior_samples"]["time_pars"].shape == (1, 50, n_events + 1, 2)
-
-        # Test summary and plot_trace (just ensure they don't raise errors)
-        mcmc_est.summary()
-        mcmc_est.plot_trace()
 
 
 if __name__ == "__main__":

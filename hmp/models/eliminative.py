@@ -90,7 +90,7 @@ class EliminativeMethod(BaseModel):
             print(
                 f"Estimating all solutions for maximal number of events ({max_events})"
             )
-            base_fit = self.get_event_model(n_events=max_events, starting_points=1)
+            base_fit = self.get_event_model(n_events=max_events, starting_points=1, trial_data=trial_data)
             base_fit.fit(trial_data, verbose=False, cpus=cpus)
         else:
             base_fit = self.base_fit
@@ -98,7 +98,7 @@ class EliminativeMethod(BaseModel):
         self.submodels[max_events] = base_fit
 
         for n_events in np.arange(max_events - 1, min_events, -1):
-            event_model = self.get_event_model(n_events, starting_points=n_events+1)
+            event_model = self.get_event_model(n_events, starting_points=n_events+1, trial_data=trial_data)
 
             print(f"Estimating all solutions for {n_events} events")
 
@@ -172,9 +172,10 @@ class EliminativeMethod(BaseModel):
             return self._concatted_attr(attr)
         return super().__getattribute__(attr)
 
-    def get_event_model(self, n_events, starting_points):
+    def get_event_model(self, n_events, starting_points, trial_data):
         return EventModel(
             self.pattern, self.distribution, n_events=n_events,
             starting_points=starting_points,
             tolerance=self.tolerance,
-            max_iteration=self.max_iteration)
+            max_iteration=self.max_iteration,
+            max_scale=trial_data.durations.mean())
