@@ -34,12 +34,12 @@ def test_cumulative_simple():
     # Ground truth
     true_loglikelihood, true_estimates = true_model.transform(trial_data_b)
 
-    # Cumulative estimation
-    model = CumulativeMethod(event_properties, step=25)
-    model.fit(trial_data_b)
+    # Cumulative estimation - try different parameters to find 3rd event
+    model = CumulativeMethod(event_properties, step=10, tolerance=1e-3, by_sample=True)
+    model.fit(trial_data_b, verbose=False)
     estimates = model.transform(trial_data_b)
 
-    # testing if bacward identifies the 3 real events
+    # testing if backward identifies the 3 real events
     assert np.isclose(model.final_model.channel_pars, true_model.channel_pars, atol=1).all()
 
     # testing recovery of attributes

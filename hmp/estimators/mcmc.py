@@ -25,6 +25,13 @@ except ImportError:
     pytensor = None
     at = None
 
+try:
+    from .jax_ops_simple import JAXHMPLikelihoodOp, check_jax_available
+    JAX_OP_AVAILABLE = check_jax_available() and PYMC_AVAILABLE and JAXHMPLikelihoodOp is not None
+except ImportError:
+    JAX_OP_AVAILABLE = False
+    JAXHMPLikelihoodOp = None
+
 
 class MCMCEstimator(BaseEstimator):
     """MCMC parameter estimator using PyMC.
@@ -85,7 +92,9 @@ class MCMCEstimator(BaseEstimator):
             raise ValueError(f"step_method must be one of {valid_methods}, got '{step_method}'")
         
     def fit(self, trial_data, initial_channel_pars: np.ndarray, 
-           initial_time_pars: np.ndarray, model=None, verbose: bool = True, **kwargs) -> EstimationResult:
+           initial_time_pars: np.ndarray, model=None, verbose: bool = True, 
+           fixed_channel_pars: Optional[list] = None,
+           fixed_time_pars: Optional[list] = None, **kwargs) -> EstimationResult:
         """Fit model parameters using MCMC.
         
         Parameters
@@ -98,6 +107,15 @@ class MCMCEstimator(BaseEstimator):
             Initial time distribution parameter values (used for initialization)
         model : EventModel
             The model instance (needed for likelihood computation)
+        verbose : bool, optional
+            Whether to print verbose output. Default is True.
+        fixed_channel_pars : list, optional
+            List of channel parameter indices to fix during estimation. 
+            Not currently implemented. Default is None.
+        fixed_time_pars : list, optional
+            List of time parameter indices to fix during estimation.
+            Use [0] to fix shape parameters, [1] to fix scale parameters,
+            or [0, 1] to fix both. Default is None (estimate all parameters).
         **kwargs
             Additional fitting options (currently unused)
             
@@ -119,10 +137,15 @@ class MCMCEstimator(BaseEstimator):
                 warn("MCMC estimator currently only supports single-group models. Using parameters from the first group.")
             initial_time_pars = initial_time_pars[0]
 
-        # Replace NaNs in initial_time_pars with default values
+        # Replace NaNs in initial_time_pars with default values and ensure positivity
         for i in range(initial_time_pars.shape[0]):
-            if np.isnan(initial_time_pars[i, 0]):
-                initial_time_pars[i, :] = [2.0, 10.0]
+            if np.isnan(initial_time_pars[i, 0]) or initial_time_pars[i, 0] <= 0:
+                initial_time_pars[i, 0] = 2.0  # shape parameter
+            if np.isnan(initial_time_pars[i, 1]) or initial_time_pars[i, 1] <= 0:
+                initial_time_pars[i, 1] = 10.0  # scale parameter
+        
+        # Ensure time parameters are positive (required for gamma distribution)
+        initial_time_pars = np.maximum(initial_time_pars, 1e-6)
         if initial_channel_pars.ndim > 2:
             if initial_channel_pars.shape[0] > 1:
                 warn("MCMC estimator currently only supports single-group models. Using parameters from the first group.")
@@ -132,6 +155,9 @@ class MCMCEstimator(BaseEstimator):
         n_events = initial_channel_pars.shape[-2]
         n_dims = initial_channel_pars.shape[-1]
         n_stages = initial_time_pars.shape[-2]
+        
+        # Store for JAX implementation
+        self._n_events = n_events
         
         # Build the PyMC model
         with pm.Model() as pymc_model:
@@ -147,21 +173,27 @@ class MCMCEstimator(BaseEstimator):
             )
             
             # Time parameter priors
-            # Shape parameters (must be positive)
-            shape_pars = pm.HalfNormal(
-                "shape_pars",
-                sigma=self.prior_config.get("shape_sigma", 2.0),
-                shape=n_stages,
-                initval=initial_time_pars[..., 0]
-            )
-            
-            # Scale parameters (must be positive)
-            scale_pars = pm.HalfNormal(
-                "scale_pars", 
-                sigma=self.prior_config.get("scale_sigma", 5.0),
-                shape=n_stages,
-                initval=initial_time_pars[..., 1]
-            )
+            if fixed_time_pars is not None and 0 in fixed_time_pars:
+                shape_pars = pm.Deterministic("shape_pars", at.as_tensor_variable(initial_time_pars[..., 0]))
+            else:
+                # Shape parameters (must be positive)
+                shape_pars = pm.HalfNormal(
+                    "shape_pars",
+                    sigma=self.prior_config.get("shape_sigma", 2.0),
+                    shape=n_stages,
+                    initval=initial_time_pars[..., 0]
+                )
+
+            if fixed_time_pars is not None and 1 in fixed_time_pars:
+                scale_pars = pm.Deterministic("scale_pars", at.as_tensor_variable(initial_time_pars[..., 1]))
+            else:
+                # Scale parameters (must be positive)
+                scale_pars = pm.HalfNormal(
+                    "scale_pars", 
+                    sigma=self.prior_config.get("scale_sigma", 5.0),
+                    shape=n_stages,
+                    initval=initial_time_pars[..., 1]
+                )
             
             # Combine time parameters
             time_pars = pm.Deterministic(
@@ -212,11 +244,12 @@ class MCMCEstimator(BaseEstimator):
         ess = az.ess(self.trace)
         
         # Check convergence
-        converged = bool(
-            (rhat["channel_pars"].max() < 1.1).values and
-            (rhat["shape_pars"].max() < 1.1).values and 
-            (rhat["scale_pars"].max() < 1.1).values
-        )
+        converged = (rhat["channel_pars"].max() < 1.1).values
+        if "shape_pars" in rhat:
+            converged = converged and (rhat["shape_pars"].max() < 1.1).values
+        if "scale_pars" in rhat:
+            converged = converged and (rhat["scale_pars"].max() < 1.1).values
+        converged = bool(converged)
         
         # Uncertainty estimates
         uncertainty = {
@@ -237,20 +270,24 @@ class MCMCEstimator(BaseEstimator):
         }
         
         # Diagnostics
+        rhat_dict = {"channel_pars": rhat["channel_pars"].values}
+        if "shape_pars" in rhat:
+            rhat_dict["shape_pars"] = rhat["shape_pars"].values
+        if "scale_pars" in rhat:
+            rhat_dict["scale_pars"] = rhat["scale_pars"].values
+            
+        ess_dict = {"channel_pars": ess["channel_pars"].values}
+        if "shape_pars" in ess:
+            ess_dict["shape_pars"] = ess["shape_pars"].values
+        if "scale_pars" in ess:
+            ess_dict["scale_pars"] = ess["scale_pars"].values
+            
         diagnostics = {
             "method": "MCMC",
             "step_method": self.step_method,
             "gradients_used": getattr(self, '_gradients_available', False),
-            "rhat": {
-                "channel_pars": rhat["channel_pars"].values,
-                "shape_pars": rhat["shape_pars"].values,
-                "scale_pars": rhat["scale_pars"].values,
-            },
-            "ess": {
-                "channel_pars": ess["channel_pars"].values,
-                "shape_pars": ess["shape_pars"].values,
-                "scale_pars": ess["scale_pars"].values,
-            },
+            "rhat": rhat_dict,
+            "ess": ess_dict,
             "n_samples": self.n_samples,
             "n_chains": self.n_chains,
             "trace": self.trace
@@ -273,16 +310,22 @@ class MCMCEstimator(BaseEstimator):
         import warnings
         
         # Check if gradients are available for the likelihood
-        has_gradients = self.use_gradients and hasattr(self, '_gradients_available')
+        has_gradients = self.use_gradients and hasattr(self, '_gradients_available') and self._gradients_available
         
         if self.step_method == 'auto':
             if self.use_gradients and has_gradients:
                 if hasattr(self, '_verbose') and self._verbose:
-                    print("Using NUTS sampler with gradients")
+                    gradient_method = "JAX" if JAX_OP_AVAILABLE else "PyTensor"
+                    print(f"Using NUTS sampler with {gradient_method} gradients")
                 return pm.NUTS(target_accept=self.target_accept)
             else:
                 if hasattr(self, '_verbose') and self._verbose:
-                    reason = "gradients disabled" if not self.use_gradients else "gradients not available"
+                    if not self.use_gradients:
+                        reason = "gradients disabled"
+                    elif not JAX_OP_AVAILABLE:
+                        reason = "JAX not available, PyTensor gradients failed"
+                    else:
+                        reason = "gradients not available"
                     print(f"Using Metropolis sampler ({reason})")
                 return pm.Metropolis()
         elif self.step_method == 'nuts':
@@ -305,227 +348,56 @@ class MCMCEstimator(BaseEstimator):
     def _log_likelihood_func(self, trial_data, model, channel_pars, time_pars):
         """
         Returns a log-likelihood function for PyMC model.
-        This function computes the HMP log-likelihood using the forward-backward algorithm.
+        This function computes the HMP log-likelihood using the JAX-based forward-backward algorithm.
         """
+        if not JAX_OP_AVAILABLE:
+            raise ImportError(
+                "JAX is required for MCMC estimation. Install with: pip install 'hmp[mcmc]'"
+            )
+        return self._log_likelihood_func_jax(trial_data, model, channel_pars, time_pars)
+    
+    def _log_likelihood_func_jax(self, trial_data, model, channel_pars, time_pars):
+        """JAX-based log-likelihood function with automatic differentiation."""
         import pytensor.tensor as at
-        from pytensor.graph.op import Op
-        from pytensor.graph.basic import Apply
         
-        class HMPLogLikelihood(Op):
-            """Custom PyTensor Op for HMP log-likelihood computation with PyTensor-based gradients."""
-            
-            def __init__(self, use_gradients=True, gradient_eps=1e-6):
-                self.use_gradients = use_gradients
-                self.gradient_eps = gradient_eps
-            
-            def connection_pattern(self, node):
-                """Specify how inputs connect to outputs for gradient computation."""
-                # Both channel_pars and time_pars affect the single output (log-likelihood)
-                return [[True], [True]]  # [input 0 -> output 0, input 1 -> output 0]
-            
-            def infer_shape(self, fgraph, node, input_shapes):
-                """Infer the shape of the output given input shapes."""
-                # Output is a scalar (log-likelihood)
-                return [()]
-            
-            def make_node(self, channel_pars, time_pars):
-                # Inputs
-                channel_pars = at.as_tensor_variable(channel_pars)
-                time_pars = at.as_tensor_variable(time_pars)
-                # Output: scalar log-likelihood
-                output = at.scalar('float64')
-                return Apply(self, [channel_pars, time_pars], [output])
-            
-            def perform(self, node, inputs, outputs):
-                channel_pars_np, time_pars_np = inputs
-                
-                # Always use the proven NumPy implementation for likelihood computation
-                log_likelihood, _ = model.estim_probs(trial_data, channel_pars_np, time_pars_np)
-                outputs[0][0] = np.array(log_likelihood, dtype=np.float64)
-            
-            def grad(self, inputs, output_grads):
-                """Compute gradients using PyTensor automatic differentiation."""
-                if not self.use_gradients:
-                    # Return None to indicate no gradient available
-                    return [None, None]
-                
-                try:
-                    channel_pars, time_pars = inputs
-                    output_grad = output_grads[0]
-                    
-                    # Create a simplified differentiable likelihood directly using the input variables
-                    # This maintains the computational graph connection
-                    
-                    # Channel contribution: cross_corr @ channel_pars.T summed
-                    # Use static trial data to avoid graph disconnection
-                    cross_corr_tensor = at.as_tensor_variable(trial_data.cross_corr, dtype='float64')
-                    channel_activations = at.dot(cross_corr_tensor, channel_pars.T)
-                    channel_contribution = at.sum(channel_activations)
-                    
-                    # Time contribution: simplified gamma log-pdf terms  
-                    time_contribution = at.constant(0.0, dtype='float64')
-                    mean_duration = float(np.mean(trial_data.durations))
-                    
-                    # Time parameter contribution - use a fixed number of stages to avoid dynamic shape issues
-                    # Most HMP models have 2-3 stages, so we'll handle the first 3 stages
-                    n_stages = 3  # Fixed for PyTensor compatibility
-                    
-                    for stage in range(n_stages):
-                        # Use conditional to handle varying number of actual stages
-                        shape = time_pars[stage, 0]
-                        scale = time_pars[stage, 1]
-                        
-                        # Simplified stage duration (constant for differentiability)
-                        stage_duration = mean_duration / float(n_stages)
-                        
-                        # Gamma log-pdf terms (simplified for gradients)
-                        log_pdf = (shape - 1.0) * at.log(at.maximum(stage_duration, 1e-6)) - stage_duration / at.maximum(scale, 1e-6)
-                        time_contribution = time_contribution + log_pdf
-                    
-                    # Total likelihood
-                    likelihood_expr = channel_contribution + time_contribution
-                    
-                    # Compute gradients using automatic differentiation
-                    channel_grad = at.grad(likelihood_expr, channel_pars)
-                    time_grad = at.grad(likelihood_expr, time_pars)
-                    
-                    return [channel_grad * output_grad, time_grad * output_grad]
-                    
-                except Exception as e:
-                    # If PyTensor gradients fail, fall back to finite differences
-                    import warnings
-                    warnings.warn(f"PyTensor gradient computation failed: {e}. Falling back to finite differences.", UserWarning)
-                    
-                    # Use finite difference fallback
-                    channel_grad_op = ChannelGradientOp(self.gradient_eps)
-                    time_grad_op = TimeGradientOp(self.gradient_eps)
-                    
-                    channel_grad = channel_grad_op(channel_pars, time_pars)
-                    time_grad = time_grad_op(channel_pars, time_pars)
-                    
-                    return [channel_grad * output_grads[0], time_grad * output_grads[0]]
+        # Prepare static data for JAX
+        cross_corr = trial_data.cross_corr
+        durations = trial_data.durations
+        starts = trial_data.starts  
+        ends = trial_data.ends
+        n_trials = trial_data.n_trials
+        n_samples = trial_data.n_samples
+        n_dims = trial_data.n_dims
         
-        class ChannelGradientOp(Op):
-            """Op for computing channel parameter gradients."""
-            
-            def __init__(self, eps):
-                self.eps = eps
-            
-            def make_node(self, channel_pars, time_pars):
-                channel_pars = at.as_tensor_variable(channel_pars)
-                time_pars = at.as_tensor_variable(time_pars)
-                output = channel_pars.type()
-                return Apply(self, [channel_pars, time_pars], [output])
-            
-            def perform(self, node, inputs, outputs):
-                channel_pars_np, time_pars_np = inputs
-                
-                grad = np.zeros_like(channel_pars_np)
-                flat_channel = channel_pars_np.flatten()
-                
-                for i in range(len(flat_channel)):
-                    # Create perturbed version
-                    channel_plus = flat_channel.copy()
-                    channel_plus[i] += self.eps
-                    channel_plus_shaped = channel_plus.reshape(channel_pars_np.shape)
-                    
-                    # Clip channel parameters to reasonable bounds to prevent numerical issues
-                    channel_plus_shaped = np.clip(channel_plus_shaped, -1e3, 1e3)
-                    
-                    # Compute likelihood at perturbed point
-                    try:
-                        ll_plus, _ = model.estim_probs(trial_data, channel_plus_shaped, time_pars_np)
-                        ll_current, _ = model.estim_probs(trial_data, channel_pars_np, time_pars_np)
-                        
-                        # Check for valid likelihood values
-                        if (np.isfinite(ll_plus) and np.isfinite(ll_current) and 
-                            not np.isnan(ll_plus) and not np.isnan(ll_current)):
-                            # Finite difference
-                            flat_grad = grad.flatten()
-                            grad_val = (ll_plus - ll_current) / self.eps
-                            # Additional safety check for gradient value
-                            if np.isfinite(grad_val) and not np.isnan(grad_val):
-                                flat_grad[i] = grad_val
-                            grad = flat_grad.reshape(channel_pars_np.shape)
-                    except Exception:
-                        # If computation fails, set gradient to zero
-                        pass
-                
-                outputs[0][0] = grad.astype(np.float64)
+        # Get number of events from initial parameters shape (before PyTensor tensors)
+        # We need to access this during model building, not during tensor computation
+        if hasattr(self, '_n_events'):
+            n_events = self._n_events
+        else:
+            # This will be set during the fit method before this function is called
+            raise ValueError("Number of events not set. This should be set in fit method.")
         
-        class TimeGradientOp(Op):
-            """Op for computing time parameter gradients."""
-            
-            def __init__(self, eps):
-                self.eps = eps
-            
-            def make_node(self, channel_pars, time_pars):
-                channel_pars = at.as_tensor_variable(channel_pars)
-                time_pars = at.as_tensor_variable(time_pars)
-                output = time_pars.type()
-                return Apply(self, [channel_pars, time_pars], [output])
-            
-            def perform(self, node, inputs, outputs):
-                channel_pars_np, time_pars_np = inputs
-                
-                grad = np.zeros_like(time_pars_np)
-                flat_time = time_pars_np.flatten()
-                
-                for i in range(len(flat_time)):
-                    # Create perturbed version
-                    time_plus = flat_time.copy()
-                    time_plus[i] += self.eps
-                    time_plus_shaped = time_plus.reshape(time_pars_np.shape)
-                    
-                    # Ensure time parameters remain positive and reasonable
-                    # Clamp to reasonable bounds to prevent numerical issues
-                    time_plus_shaped = np.clip(time_plus_shaped, 1e-6, 1e6)
-                    
-                    # Compute likelihood at perturbed point
-                    try:
-                        ll_plus, _ = model.estim_probs(trial_data, channel_pars_np, time_plus_shaped)
-                        ll_current, _ = model.estim_probs(trial_data, channel_pars_np, time_pars_np)
-                        
-                        # Check for valid likelihood values
-                        if (np.isfinite(ll_plus) and np.isfinite(ll_current) and 
-                            not np.isnan(ll_plus) and not np.isnan(ll_current)):
-                            # Finite difference
-                            flat_grad = grad.flatten()
-                            grad_val = (ll_plus - ll_current) / self.eps
-                            # Additional safety check for gradient value
-                            if np.isfinite(grad_val) and not np.isnan(grad_val):
-                                flat_grad[i] = grad_val
-                            grad = flat_grad.reshape(time_pars_np.shape)
-                    except Exception:
-                        # If computation fails, set gradient to zero
-                        pass
-                
-                outputs[0][0] = grad.astype(np.float64)
+        n_stages = n_events + 1
+        locations = np.zeros(n_stages, dtype=int)
+        if hasattr(model, 'location') and model.location is not None:
+            locations[1:-1] = model.location
         
-        # Create and use the custom op with gradient configuration
-        hmp_likelihood_op = HMPLogLikelihood(
-            use_gradients=self.use_gradients,
-            gradient_eps=self.gradient_eps
-        )
-        likelihood_result = hmp_likelihood_op(channel_pars, time_pars)
+        # Create JAX Op and apply it
+        jax_op = JAXHMPLikelihoodOp()
+        likelihood_result = jax_op.make_node(
+            channel_pars, time_pars,
+            at.as_tensor_variable(cross_corr),
+            at.as_tensor_variable(durations),
+            at.as_tensor_variable(starts),
+            at.as_tensor_variable(ends),
+            at.as_tensor_variable(locations)
+        ).outputs[0]
         
-        # Test gradient availability by trying a small computation
-        try:
-            if self.use_gradients:
-                # Try computing a small gradient to verify it works
-                test_channel = np.random.randn(2, 3) * 0.1
-                test_time = np.array([[2.0, 1.0], [2.0, 1.0], [2.0, 1.0]])
-                test_op = HMPLogLikelihood(use_gradients=True, gradient_eps=self.gradient_eps)
-                # This will validate gradient computation without actually computing it
-                self._gradients_available = True
-            else:
-                self._gradients_available = False
-        except Exception as e:
-            if verbose:
-                print(f"Gradient validation failed: {e}. Using gradient-free sampling.")
-            self._gradients_available = False
+        # Mark gradients as available
+        self._gradients_available = True
         
         return likelihood_result
+    
 
     def supports_uncertainty(self) -> bool:
         """MCMC provides uncertainty estimates through posterior distributions."""

@@ -37,11 +37,11 @@ class EMEstimator(BaseEstimator):
         
     def fit(self, trial_data, initial_channel_pars: np.ndarray, 
            initial_time_pars: np.ndarray, model=None,
-           fixed_channel_pars: Optional[List[int]] = None,
-           fixed_time_pars: Optional[List[int]] = None,
            channel_map: Optional[np.ndarray] = None,
            time_map: Optional[np.ndarray] = None,
            groups: Optional[np.ndarray] = None,
+           fixed_channel_pars: Optional[List[int]] = None,
+           fixed_time_pars: Optional[List[int]] = None,
            cpus: int = 1, **kwargs) -> EstimationResult:
         """Fit model parameters using expectation-maximization.
         
@@ -55,16 +55,16 @@ class EMEstimator(BaseEstimator):
             Initial time distribution parameter values
         model : EventModel
             The model instance (needed for method calls)
-        fixed_channel_pars : list[int], optional
-            Indices of channel parameters to fix during estimation
-        fixed_time_pars : list[int], optional
-            Indices of time parameters to fix during estimation
         channel_map : np.ndarray, optional
             2D array mapping channel parameters to groups
         time_map : np.ndarray, optional
             2D array mapping time parameters to groups
         groups : np.ndarray, optional
             Array indicating the groups for grouping modeling
+        fixed_channel_pars : list[int], optional
+            Indices of channel parameters to fix during estimation
+        fixed_time_pars : list[int], optional
+            Indices of time parameters to fix during estimation
         cpus : int, optional
             Number of cores to use. Default is 1.
             

@@ -218,6 +218,33 @@ class EventModel(BaseModel):
             If estimator is None, returns None and sets model attributes (backward compatibility).
         """
 
+        # Check for backward compatibility: only if simple fit() call with no grouping/mapping parameters
+        if (channel_pars is None and time_pars is None and estimator is None and
+            channel_map is None and time_map is None and grouping_dict is None and
+            hasattr(self, 'channel_pars') and hasattr(self, 'time_pars') and
+            self.channel_pars is not None and self.time_pars is not None):
+            
+            if verbose:
+                print(f"Using existing model parameters (backward compatibility mode)")
+            
+            # Set required attributes that would normally be set during parameter preparation
+            self.n_dims = trial_data.n_dims
+            
+            # Set additional attributes expected by the model 
+            if not hasattr(self, 'time_pars_dev'):
+                self.time_pars_dev = np.array([self.time_pars])  # Store as array-like structure
+            
+            # Set fitted flag and compute likelihood using existing parameters
+            self._fitted = True
+            likelihood, _ = self.transform(trial_data)
+            self.lkhs = likelihood[0] if isinstance(likelihood, (list, np.ndarray)) else likelihood
+            
+            if not hasattr(self, 'traces'):
+                # Create a proper traces array with shape (em_iteration, group)
+                self.traces = np.array([[self.lkhs]])  # Shape: (1 iteration, 1 group)
+            
+            return
+
         # If an estimator is provided, use the new estimation framework
         if estimator is not None:
             if EstimationResult is None:
@@ -253,7 +280,26 @@ class EventModel(BaseModel):
             self.channel_pars = result.channel_pars
             self.time_pars = result.time_pars
             self.traces = result.diagnostics.get('traces', [result.likelihood])
-            self.time_pars_dev = result.diagnostics.get('time_pars_dev', [result.time_pars])
+            
+            # Handle time_pars_dev properly for cumulative method compatibility
+            time_pars_dev_from_estimator = result.diagnostics.get('time_pars_dev', None)
+            if time_pars_dev_from_estimator is not None:
+                # If time_pars_dev is 3D (from multi-group), take first group for compatibility
+                if isinstance(time_pars_dev_from_estimator, np.ndarray) and time_pars_dev_from_estimator.ndim == 4:
+                    # Shape is (iterations, groups, stages, 2) -> take first group
+                    self.time_pars_dev = time_pars_dev_from_estimator[:, 0, :, :]
+                elif isinstance(time_pars_dev_from_estimator, np.ndarray) and time_pars_dev_from_estimator.ndim == 3:
+                    # Shape is (iterations, stages, 2) -> already correct
+                    self.time_pars_dev = time_pars_dev_from_estimator
+                else:
+                    # Convert to list if needed
+                    self.time_pars_dev = list(time_pars_dev_from_estimator)
+            else:
+                # Fallback: create from final time_pars
+                if result.time_pars.ndim == 3:
+                    self.time_pars_dev = [result.time_pars[0]]  # Take first group
+                else:
+                    self.time_pars_dev = [result.time_pars]
             self.grouping_dict = grouping_dict
             self.group = groups
             self.channel_map = channel_map
@@ -647,14 +693,14 @@ class EventModel(BaseModel):
         i = 0
 
         while i < max_iteration:  # Expectation-Maximization algorithm
+            # As long as new run gives better likelihood, go on
+            lkh_prev = lkh.copy()
+            
             if i >= min_iteration and (
                 np.isneginf(lkh.sum()) or \
                 tolerance > (lkh.sum() - lkh_prev.sum()) / np.abs(lkh_prev.sum())
             ):
                 break
-
-            # As long as new run gives better likelihood, go on
-            lkh_prev = lkh.copy()
 
             for cur_group in data_groups:  # get params/c_pars
                 channel_map_group = np.where(channel_map[cur_group, :] >= 0)[0]
@@ -1126,188 +1172,6 @@ class EventModel(BaseModel):
         
         return p
 
-    # ========================================================================
-    # PyTensor Implementation (Parallel to NumPy - for MCMC gradients only)
-    # ========================================================================
-    
-    def _compute_gains_pytensor(self, trial_data, channel_pars):
-        """
-        PyTensor implementation of gains computation for automatic differentiation.
-        
-        This is a parallel implementation that produces identical results to the
-        NumPy version in estim_probs(), but using PyTensor operations for AD.
-        
-        Parameters
-        ----------
-        trial_data : TrialData
-            The trial data containing cross-correlation information
-        channel_pars : pytensor tensor
-            Channel parameters as PyTensor tensor
-            
-        Returns
-        -------
-        gains : pytensor tensor
-            Computed gains tensor
-        """
-        try:
-            import pytensor.tensor as at
-        except ImportError:
-            raise ImportError("PyTensor is required for gradient computation")
-        
-        # Convert cross_corr to PyTensor tensor if needed
-        if hasattr(trial_data, 'cross_corr'):
-            cross_corr_tensor = at.as_tensor_variable(trial_data.cross_corr)
-        else:
-            raise ValueError("trial_data must have cross_corr attribute")
-        
-        # Initialize gains tensor
-        n_samples = cross_corr_tensor.shape[0]
-        n_events = channel_pars.shape[0]
-        gains = at.zeros((n_samples, n_events), dtype='float64')
-        
-        # Compute gains: gains = sum_i(cross_corr[:, i] * channel_pars[:, i] - channel_pars[:, i]^2 / 2)
-        for i in range(trial_data.n_dims):
-            cross_corr_i = cross_corr_tensor[:, i]
-            channel_pars_i = channel_pars[:, i]
-            
-            # Broadcast and compute gains contribution
-            gains_contrib = (cross_corr_i.dimshuffle(0, 'x') * channel_pars_i.dimshuffle('x', 0) 
-                           - channel_pars_i.dimshuffle('x', 0) ** 2 / 2)
-            gains = gains + gains_contrib
-        
-        return at.exp(gains)
-    
-    def _distribution_pdf_pytensor(self, shape, scale, max_duration):
-        """
-        PyTensor implementation of distribution PDF computation.
-        
-        Parameters
-        ----------
-        shape : pytensor scalar
-            Shape parameter
-        scale : pytensor scalar  
-            Scale parameter
-        max_duration : int
-            Maximum duration for PDF computation
-            
-        Returns
-        -------
-        p : pytensor tensor
-            Normalized probability mass function
-        """
-        try:
-            import pytensor.tensor as at
-        except ImportError:
-            raise ImportError("PyTensor is required for gradient computation")
-        
-        # Create range tensor
-        x = at.arange(max_duration, dtype='float64')
-        
-        # Use scipy.stats.gamma.pdf equivalent formula
-        # For x=0, need special handling since 0^(shape-1) is problematic
-        
-        shape_safe = at.maximum(shape, 1e-8)
-        scale_safe = at.maximum(scale, 1e-8)
-        
-        # Handle x=0 case separately
-        # For gamma distribution: PDF(0) = 0 if shape > 1, infinity if shape < 1, 1/scale if shape = 1
-        p = at.zeros_like(x, dtype='float64')
-        
-        # For x > 0, use the standard gamma PDF formula
-        x_positive = x > 0
-        x_safe = at.switch(x_positive, x, 1.0)  # Replace 0 with 1 to avoid log(0)
-        
-        # Compute log PDF for numerical stability (only for x > 0)
-        log_pdf = at.switch(x_positive,
-                           (shape_safe - 1) * at.log(x_safe) 
-                           - x_safe / scale_safe 
-                           - shape_safe * at.log(scale_safe) 
-                           - at.gammaln(shape_safe),
-                           -np.inf)  # log(0) for x = 0
-        
-        # Convert back to PDF
-        p = at.exp(log_pdf)
-        
-        # Handle numerical issues
-        p = at.switch(at.isnan(p), 0.0, p)
-        p = at.switch(at.isinf(p), 0.0, p)
-        p = at.clip(p, 1e-15, 1e10)
-        
-        # Normalize to ensure it sums to 1
-        p_sum = at.sum(p)
-        p_normalized = at.switch(at.gt(p_sum, 1e-15), 
-                                p / p_sum, 
-                                at.ones_like(p) / max_duration)
-        
-        return p_normalized
-    
-    def _estim_probs_pytensor(self, trial_data, channel_pars, time_pars):
-        """
-        PyTensor implementation of the forward-backward algorithm for automatic differentiation.
-        
-        This method produces identical results to estim_probs() but uses PyTensor operations
-        to enable automatic differentiation. It is used only for MCMC gradient computation.
-        
-        WARNING: This is a complex implementation and should be used only for gradients.
-        All other use cases should use the proven NumPy implementation in estim_probs().
-        
-        Parameters
-        ----------
-        trial_data : TrialData
-            The trial data
-        channel_pars : pytensor tensor
-            Channel parameters  
-        time_pars : pytensor tensor
-            Time distribution parameters
-            
-        Returns
-        -------
-        likelihood : pytensor scalar
-            Log-likelihood value
-        """
-        try:
-            import pytensor.tensor as at
-        except ImportError:
-            raise ImportError("PyTensor is required for gradient computation")
-        
-        # Basic setup - get actual values, not tensor variables
-        n_events_val = int(channel_pars.eval().shape[0]) if hasattr(channel_pars, 'eval') else int(channel_pars.shape[0])
-        n_stages_val = n_events_val + 1
-        n_trials = trial_data.n_trials
-        
-        # Compute gains using PyTensor
-        gains = self._compute_gains_pytensor(trial_data, channel_pars)
-        
-        # Simplified likelihood computation that maintains differentiability
-        # This approximates the full forward-backward algorithm for gradient computation
-        
-        # Compute channel contribution using matrix operations
-        all_cross_corr = at.as_tensor_variable(trial_data.cross_corr)
-        channel_activations = at.dot(all_cross_corr, channel_pars.T)  # (n_samples, n_events)
-        
-        # Weight by gains and sum
-        weighted_activations = channel_activations * gains
-        channel_contribution = at.sum(weighted_activations)
-        
-        # Compute time distribution contribution
-        time_contribution = at.constant(0.0)
-        for stage in range(n_stages_val):
-            if stage < time_pars.shape[0]:
-                shape = time_pars[stage, 0]
-                scale = time_pars[stage, 1]
-                
-                # Simplified duration based on trial structure
-                mean_duration = at.constant(float(np.mean(trial_data.durations)))
-                stage_duration = at.maximum(mean_duration / n_stages_val, at.constant(1.0))
-                
-                # Simplified gamma log-pdf (without constants for gradient computation)
-                log_pdf = (shape - 1.0) * at.log(stage_duration) - stage_duration / scale
-                time_contribution = time_contribution + log_pdf
-        
-        # Combine contributions
-        total_log_likelihood = channel_contribution + time_contribution
-        
-        return total_log_likelihood
 
     def group_constructor(
         self, 

@@ -57,7 +57,8 @@ class BaseEstimator(ABC):
         
     @abstractmethod
     def fit(self, trial_data, initial_channel_pars: np.ndarray, 
-           initial_time_pars: np.ndarray, **kwargs) -> EstimationResult:
+           initial_time_pars: np.ndarray, fixed_channel_pars: list = None, 
+           fixed_time_pars: list = None, **kwargs) -> EstimationResult:
         """Estimate model parameters.
         
         Parameters

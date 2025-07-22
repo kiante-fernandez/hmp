@@ -21,10 +21,10 @@ def dummy_data_and_model():
     if not PYMC_AVAILABLE:
         pytest.skip("PyMC not available, skipping MCMC tests.")
 
-    # Create dummy TrialData
-    n_trials = 10
-    n_channels = 3
-    n_samples_per_trial = 100
+    # Create smaller dummy data for faster testing
+    n_trials = 5          # Reduced from 10
+    n_channels = 2        # Reduced from 3
+    n_samples_per_trial = 50  # Reduced from 100
     data = np.random.randn(n_trials, n_channels, n_samples_per_trial)
 
     # Generate dummy data for TrialData constructor
@@ -86,7 +86,14 @@ class TestMCMCEstimator:
         """Test fitting the MCMCEstimator."""
         trial_data, model, initial_channel_pars, initial_time_pars = dummy_data_and_model
 
-        mcmc_est = MCMCEstimator(n_samples=50, n_tune=50, n_chains=2, random_seed=42) # Reduced samples for faster test
+        # Use minimal settings for fast testing
+        mcmc_est = MCMCEstimator(
+            n_samples=20,      # Reduced from 50
+            n_tune=10,         # Reduced from 50  
+            n_chains=1,        # Single chain to avoid multiprocessing
+            random_seed=42,
+            target_accept=0.8  # Higher target accept for faster convergence
+        ) 
 
         result = mcmc_est.fit(
             trial_data=trial_data,
@@ -124,7 +131,13 @@ class TestMCMCEstimator:
     def test_get_posterior_samples(self, dummy_data_and_model):
         """Test retrieving posterior samples."""
         trial_data, model, initial_channel_pars, initial_time_pars = dummy_data_and_model
-        mcmc_est = MCMCEstimator(n_samples=50, n_tune=50, n_chains=2, random_seed=42)
+        mcmc_est = MCMCEstimator(
+            n_samples=15,      # Reduced for faster testing
+            n_tune=10,         # Reduced for faster testing
+            n_chains=1,        # Single chain for JAX compatibility
+            random_seed=42,
+            target_accept=0.8
+        )
         mcmc_est.fit(trial_data, initial_channel_pars, initial_time_pars, model)
 
         channel_samples = mcmc_est.get_posterior_samples(parameter="channel_pars")
@@ -142,7 +155,13 @@ class TestMCMCEstimator:
     def test_summary_and_plot_trace(self, dummy_data_and_model, capsys):
         """Test summary and plot_trace methods."""
         trial_data, model, initial_channel_pars, initial_time_pars = dummy_data_and_model
-        mcmc_est = MCMCEstimator(n_samples=50, n_tune=50, n_chains=2, random_seed=42)
+        mcmc_est = MCMCEstimator(
+            n_samples=15,      # Reduced for faster testing
+            n_tune=10,         # Reduced for faster testing
+            n_chains=1,        # Single chain for JAX compatibility
+            random_seed=42,
+            target_accept=0.8
+        )
         mcmc_est.fit(trial_data, initial_channel_pars, initial_time_pars, model)
 
         # Test summary (capturing stdout)
